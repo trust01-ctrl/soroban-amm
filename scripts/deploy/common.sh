@@ -353,20 +353,40 @@ ensure_wasm_built() {
 
 # verify_token CONTRACT_ID EXPECTED_ADMIN
 # Reads the admin from the token contract and asserts it equals EXPECTED_ADMIN.
-# Uses the correct Stellar address pattern [GC][A-Z2-7]{55} to match both
-# account (G…) and contract (C…) addresses; avoids the old C-only pattern that
-# matched the contract's own ID from CLI log output instead of the stored admin.
-# A mismatch is now fatal — it indicates the contract was front-run during the
-# deploy/initialize window and the wrong address controls the token.
+# Calls the CLI directly (rather than via invoke_read, which merges stderr
+# into stdout) so a failed/panicking simulation — e.g. the RPC node hasn't yet
+# caught up with the initialize tx that just landed, so admin()'s storage read
+# panics — can be detected by exit code instead of having its diagnostic
+# output (which echoes the contract's own C… address in event-log lines)
+# mistaken for the returned admin address. Retries briefly to ride out that
+# read-after-write lag before treating it as a real front-run.
 verify_token() {
   local contract_id="$1"
   local expected_admin="$2"
-  local out admin
-  out=$(invoke_read "$contract_id" -- admin 2>&1 || true)
-  # Match both G… (account) and C… (contract) addresses: base-32 alphabet [A-Z2-7]
-  admin=$(printf '%s\n' "$out" | grep -Eo '[GC][A-Z2-7]{55}' | tail -n 1 || true)
+  local attempt out err admin rc
+  for attempt in 1 2 3 4 5; do
+    err=$(mktemp)
+    out=$(stellar contract invoke \
+      --id "$contract_id" \
+      --network "$NETWORK" \
+      --source "$SOURCE_ACCOUNT" \
+      -- admin 2>"$err")
+    rc=$?
+    admin=""
+    if [[ $rc -eq 0 ]]; then
+      # Match both G… (account) and C… (contract) addresses: base-32 alphabet [A-Z2-7]
+      admin=$(printf '%s\n' "$out" | grep -Eo '[GC][A-Z2-7]{55}' | tail -n 1 || true)
+    fi
+    if [[ -n "$admin" ]]; then
+      rm -f "$err"
+      break
+    fi
+    log "token $contract_id admin read attempt $attempt/5 failed, retrying: $(cat "$err")"
+    rm -f "$err"
+    sleep 2
+  done
   if [[ -z "$admin" ]]; then
-    die "token $contract_id admin read returned empty — possible front-run or uninitialized contract: $out"
+    die "token $contract_id admin read returned empty after retries — possible front-run or uninitialized contract"
   fi
   if [[ "$admin" != "$expected_admin" ]]; then
     die "token $contract_id admin mismatch: expected $expected_admin got $admin — possible front-run, aborting deploy"
